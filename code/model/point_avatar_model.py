@@ -5,11 +5,12 @@ import torch
 import torch.nn as nn
 from flame.FLAME import FLAME
 from pytorch3d.ops import knn_points
-from pytorch3d.renderer import (AlphaCompositor,
-                                PerspectiveCameras,
-                                PointsRasterizationSettings,
-                                PointsRasterizer,
-                                )
+from pytorch3d.renderer import (
+    # AlphaCompositor,
+    PerspectiveCameras,
+    PointsRasterizationSettings,
+    PointsRasterizer,
+)
 from pytorch3d.structures import Pointclouds
 from model.point_cloud import PointCloud
 
@@ -19,29 +20,159 @@ from model.geometry_network import GeometryNetwork
 from model.deformer_network import ForwardDeformer
 from model.texture_network import RenderingNetwork
 
-
+import t3d
+from flame.lbs import inverse_pts, forward_pts
 print_flushed = partial(print, flush=True)
+from pytorch3d.renderer.points.compositor import _add_background_color_to_images
+from pytorch3d import _C
+from pytorch3d.renderer.camera_conversions import _cameras_from_opencv_projection
+
+class _CompositeAlphaPoints(torch.autograd.Function):
+    """
+    Composite features within a z-buffer using alpha compositing. Given a z-buffer
+    with corresponding features and weights, these values are accumulated according
+    to their weights such that features nearer in depth contribute more to the final
+    feature than ones further away.
+
+    Concretely this means:
+        weighted_fs[b,c,i,j] = sum_k cum_alpha_k * features[c,pointsidx[b,k,i,j]]
+        cum_alpha_k = alphas[b,k,i,j] * prod_l=0..k-1 (1 - alphas[b,l,i,j])
+
+    Args:
+        features: Packed Tensor of shape (C, P) giving the features of each point.
+        alphas: float32 Tensor of shape (N, points_per_pixel, image_size,
+            image_size) giving the weight of each point in the z-buffer.
+            Values should be in the interval [0, 1].
+        pointsidx: int32 Tensor of shape (N, points_per_pixel, image_size, image_size)
+            giving the indices of the nearest points at each pixel, sorted in z-order.
+            Concretely pointsidx[n, k, y, x] = p means that features[:, p] is the
+            feature of the kth closest point (along the z-direction) to pixel (y, x) in
+            batch element n. This is weighted by alphas[n, k, y, x].
+
+    Returns:
+        weighted_fs: Tensor of shape (N, C, image_size, image_size)
+            giving the accumulated features at each point.
+    """
+
+    @staticmethod
+    def forward(ctx, features, alphas, points_idx):
+        pt_cld, weights = _C.accum_alphacomposite(features, alphas, points_idx)
+        ctx.mark_non_differentiable(weights) # Specifying that weights doesn't require gradient, correct?
+        ctx.save_for_backward(features.clone(), alphas.clone(), points_idx.clone())
+        return pt_cld, weights
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_weight): # grad_weight is not used.
+        grad_features = None
+        grad_alphas = None
+        grad_points_idx = None
+        features, alphas, points_idx = ctx.saved_tensors
+
+        grad_features, grad_alphas = _C.accum_alphacomposite_backward(
+            grad_output, features, alphas, points_idx
+        )
+
+        return grad_features, grad_alphas, grad_points_idx, None
+
+
+def alpha_composite(pointsidx, alphas, pt_clds) -> torch.Tensor:
+    """
+    Composite features within a z-buffer using alpha compositing. Given a z-buffer
+    with corresponding features and weights, these values are accumulated according
+    to their weights such that features nearer in depth contribute more to the final
+    feature than ones further away.
+
+    Concretely this means:
+        weighted_fs[b,c,i,j] = sum_k cum_alpha_k * features[c,pointsidx[b,k,i,j]]
+        cum_alpha_k = alphas[b,k,i,j] * prod_l=0..k-1 (1 - alphas[b,l,i,j])
+
+
+    Args:
+        pt_clds: Tensor of shape (N, C, P) giving the features of each point (can use
+            RGB for example).
+        alphas: float32 Tensor of shape (N, points_per_pixel, image_size,
+            image_size) giving the weight of each point in the z-buffer.
+            Values should be in the interval [0, 1].
+        pointsidx: int32 Tensor of shape (N, points_per_pixel, image_size, image_size)
+            giving the indices of the nearest points at each pixel, sorted in z-order.
+            Concretely pointsidx[n, k, y, x] = p means that features[n, :, p] is the
+            feature of the kth closest point (along the z-direction) to pixel (y, x) in
+            batch element n. This is weighted by alphas[n, k, y, x].
+
+    Returns:
+        Combined features: Tensor of shape (N, C, image_size, image_size)
+            giving the accumulated features at each point.
+    """
+    # pyre-fixme[16]: `_CompositeAlphaPoints` has no attribute `apply`.
+    return _CompositeAlphaPoints.apply(pt_clds, alphas, pointsidx)
+
+class AlphaCompositor(torch.nn.Module):
+    def __init__(
+        self, background_color=None
+    ) -> None:
+        super().__init__()
+        self.background_color = background_color
+    
+    def forward(self, fragments, alphas, ptclds, **kwargs) -> torch.Tensor:
+        background_color = kwargs.get('background_color', self.background_color)
+        images, weights = alpha_composite(fragments, alphas, ptclds)
+
+        if background_color is not None and images.shape[1] == 4:
+            return _add_background_color_to_images(fragments, images, background_color)
+        return images, weights
 
 
 class PointAvatar(nn.Module):
-    def __init__(self, conf, shape_params, img_res, canonical_expression, canonical_pose, use_background):
+    def __init__(
+        self, 
+        conf, 
+        shape_params, 
+        img_res, 
+        canonical_expression, 
+        canonical_pose, 
+        use_background,
+        flame_kwargs={}
+    ):
         super().__init__()
-        self.FLAMEServer = FLAME('./flame/FLAME2020/generic_model.pkl', './flame/FLAME2020/landmark_embedding.npy',
-                                 n_shape=100,
-                                 n_exp=50,
-                                 shape_params=shape_params,
-                                 canonical_expression=canonical_expression,
-                                 canonical_pose=canonical_pose).cuda()
-        self.FLAMEServer.canonical_verts, self.FLAMEServer.canonical_pose_feature, self.FLAMEServer.canonical_transformations = \
-            self.FLAMEServer(expression_params=self.FLAMEServer.canonical_exp, full_pose=self.FLAMEServer.canonical_pose)
-        self.FLAMEServer.canonical_verts = self.FLAMEServer.canonical_verts.squeeze(0)
+        self.FLAMEServer = t3d.Flame2023(
+            **flame_kwargs
+        ).cuda()
+
+
+
+        # self.FLAMEServer = FLAME('./flame/FLAME2020/generic_model.pkl', './flame/FLAME2020/landmark_embedding.npy',
+        #                          n_shape=100,
+        #                          n_exp=50,
+        #                          shape_params=shape_params,
+        #                          canonical_expression=canonical_expression,
+        #                          canonical_pose=canonical_pose).cuda()
+        # self.FLAMEServer.canonical_verts, self.FLAMEServer.canonical_pose_feature, self.FLAMEServer.canonical_transformations = \
+        #     self.FLAMEServer(expression_params=self.FLAMEServer.canonical_exp, full_pose=self.FLAMEServer.canonical_pose)
+        # self.FLAMEServer.canonical_verts = self.FLAMEServer.canonical_verts.squeeze(0)
+        
         self.prune_thresh = conf.get_float('prune_thresh', default=0.5)
         self.geometry_network = GeometryNetwork(**conf.get_config('geometry_network'))
         self.deformer_network = ForwardDeformer(FLAMEServer=self.FLAMEServer, **conf.get_config('deformer_network'))
         self.rendering_network = RenderingNetwork(**conf.get_config('rendering_network'))
         self.ghostbone = self.deformer_network.ghostbone
-        if self.ghostbone:
-            self.FLAMEServer.canonical_transformations = torch.cat([torch.eye(4).unsqueeze(0).unsqueeze(0).float().cuda(), self.FLAMEServer.canonical_transformations], 1)
+        self.canonical_expression = canonical_expression.cuda()
+        self.canonical_pose = torch.zeros(1, 15).float().cuda()
+        self.canonical_pose[:, 6] = canonical_pose
+
+        self.canonical_verts, self.canonical_transformations, self.canonical_pose_feature = self.FLAMEServer(
+            shape_params.unsqueeze(0).cuda(),
+            self.canonical_expression,
+            self.canonical_pose[:, 0:3],
+            self.canonical_pose[:, 3:6],
+            self.canonical_pose[:, 6:9],
+            self.canonical_pose[:, 9:15],
+            torch.zeros([1, 3]).cuda(),
+            return_lmks=False,
+            return_pose_feature=True,
+            return_mat_rotations=True
+        )
+        # if self.ghostbone:
+        #     self.FLAMEServer.canonical_transformations = torch.cat([torch.eye(4).unsqueeze(0).unsqueeze(0).float().cuda(), self.FLAMEServer.canonical_transformations], 1)
         self.pc = PointCloud(**conf.get_config('point_cloud')).cuda()
 
         n_points = self.pc.points.shape[0]
@@ -53,13 +184,13 @@ class PointAvatar(nn.Module):
         else:
             self.background = torch.ones(img_res[0] * img_res[1], 3).float().cuda()
         self.raster_settings = PointsRasterizationSettings(
-            image_size=img_res[0],
+            image_size=img_res,
             radius=self.pc.radius_factor * (0.75 ** math.log2(n_points / 100)),
             points_per_pixel=10
         )
         # keypoint rasterizer is only for debugging camera intrinsics
         self.raster_settings_kp = PointsRasterizationSettings(
-            image_size=self.img_res[0],
+            image_size=self.img_res,
             radius=0.007,
             points_per_pixel=1
         )
@@ -88,7 +219,10 @@ class PointAvatar(nn.Module):
         return canonical_normals, feature_vector
 
     def _render(self, point_cloud, cameras, render_kp=False):
-        rasterizer = PointsRasterizer(cameras=cameras, raster_settings=self.raster_settings if not render_kp else self.raster_settings_kp)
+        rasterizer = PointsRasterizer(
+            cameras=cameras, 
+            raster_settings=self.raster_settings if not render_kp else self.raster_settings_kp
+        )
         fragments = rasterizer(point_cloud)
         r = rasterizer.raster_settings.radius
         dists2 = fragments.dists.permute(0, 3, 1, 2)
@@ -122,20 +256,60 @@ class PointAvatar(nn.Module):
 
     def forward(self, input):
         self._output = {}
-        intrinsics = input["intrinsics"].clone()
-        cam_pose = input["cam_pose"].clone()
-        R = cam_pose[:, :3, :3]
-        T = cam_pose[:, :3, 3]
-        flame_pose = input["flame_pose"]
-        expression = input["expression"]
+        bsize = input['K'].shape[0]
+        c2w = input["c2w"].clone()
+        
+        # flame_pose = input["flame_pose"]
+        flame_pose = torch.cat([
+            input['fl_rot'],
+            input['fl_neck'],
+            input['fl_jaw'],
+            input['fl_eyes'],
+            input['fl_trans']
+        ], dim=-1)
+        # expression = input["expression"]
+        expression = input['fl_ex_params']
         batch_size = flame_pose.shape[0]
-        verts, pose_feature, transformations = self.FLAMEServer(expression_params=expression, full_pose=flame_pose)
+        verts, transformations, pose_feature, lmks3d = self.FLAMEServer(
+            id_params=input['fl_id_params'],
+            ex_params=input['fl_ex_params'],
+            rotation=input['fl_rot'],
+            neck=input['fl_neck'],
+            jaw=input['fl_jaw'],
+            eyes=input['fl_eyes'],
+            translation=input['fl_trans'],
+            return_posed_joints=False,
+            return_mat_rotations=True,
+            return_pose_feature=True,
+            static_offset=input['fl_static_offset']
+        )
 
-        if self.ghostbone:
-            # identity transformation for body
-            transformations = torch.cat([torch.eye(4).unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1, -1).float().cuda(), transformations], 1)
+        # if self.ghostbone:
+        #     # identity transformation for body
+        #     transformations = torch.cat([torch.eye(4).unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1, -1).float().cuda(), transformations], 1)
+        # T = torch.bmm(-R, T.unsqueeze(2)).squeeze(2)
+        intrinsics = torch.zeros([4, 4]).cuda().unsqueeze(0).repeat(bsize, 1, 1)
+        intrinsics[:, :3, :3] = input["K"].clone()
+        intrinsics[:, 0, 0] = intrinsics[:, 0, 0] / self.img_res[1] * 2.0
+        intrinsics[:, 1, 1] = intrinsics[:, 1, 1] / self.img_res[0] * 2.0
+        intrinsics[:, 0, 2] = -(intrinsics[:, 0, 2] / self.img_res[1] * 2.0 - 1.0) 
+        intrinsics[:, 1, 2] = -(intrinsics[:, 1, 2] / self.img_res[0] * 2.0 - 1.0)
+        intrinsics[:, 3, 2] = 1
+        intrinsics[:, 2, 3] = 1
 
-        cameras = PerspectiveCameras(device='cuda', R=R, T=T, K=intrinsics)
+        c2w[:, :3, [0, 2]] *= -1
+        w2c = torch.linalg.inv(c2w).float()
+        w2c[:, :3, :3] = w2c.clone()[:, :3, :3].transpose(2, 1)
+
+        image_size = torch.tensor([self.img_res[1], self.img_res[0]]).cuda().unsqueeze(0).repeat(bsize, 1)
+        cameras = PerspectiveCameras(
+            device='cuda', 
+            R=w2c[:, :3, :3], 
+            T=w2c[:, :3, 3], 
+            K=intrinsics, 
+            image_size=image_size,
+        )
+        
         # make sure the cameras focal length is logged too
         focal_length = intrinsics[:, [0, 1], [0, 1]]
         cameras.focal_length = focal_length
@@ -145,14 +319,14 @@ class PointAvatar(nn.Module):
         total_points = batch_size * n_points
 
         canonical_normals, feature_vector = self._compute_canonical_normals_and_feature_vectors()
-
-        transformed_points, rgb_points, albedo_points, shading_points, normals_points = self.get_rbg_value_functorch(pnts_c=self.pc.points,
-                                                                            normals=canonical_normals,
-                                                                            feature_vectors=feature_vector,
-                                                                            pose_feature=pose_feature.unsqueeze(1).expand(-1, n_points, -1).reshape(total_points, -1),
-                                                                            betas=expression.unsqueeze(1).expand(-1, n_points, -1).reshape(total_points, -1),
-                                                                            transformations=transformations.unsqueeze(1).expand(-1, n_points, -1, -1, -1).reshape(total_points, *transformations.shape[1:]),
-                                                                            )
+        transformed_points, rgb_points, albedo_points, shading_points, normals_points = self.get_rbg_value_functorch(
+            pnts_c=self.pc.points,
+            normals=canonical_normals,
+            feature_vectors=feature_vector,
+            pose_feature=pose_feature.unsqueeze(1).expand(-1, n_points, -1).reshape(total_points, -1),
+            betas=expression.unsqueeze(1).expand(-1, n_points, -1).reshape(total_points, -1),
+            transformations=transformations.unsqueeze(1).expand(-1, n_points, -1, -1, -1).reshape(total_points, *transformations.shape[1:]),
+        )
 
         shapedirs, posedirs, lbs_weights, pnts_c_flame = self.deformer_network.query_weights(self.pc.points.detach())
 
@@ -177,8 +351,8 @@ class PointAvatar(nn.Module):
 
         if not self.training:
             # render landmarks for easier camera format debugging
-            landmarks2d, landmarks3d = self.FLAMEServer.find_landmarks(verts, full_pose=flame_pose)
-            transformed_verts = Pointclouds(points=landmarks2d, features=torch.ones_like(landmarks2d))
+            # landmarks2d, landmarks3d = self.FLAMEServer.find_landmarks(verts, full_pose=flame_pose)
+            transformed_verts = Pointclouds(points=lmks3d, features=torch.ones_like(lmks3d))
             rendered_landmarks = self._render(transformed_verts, cameras, render_kp=True)
 
         foreground_mask = images[..., 3].reshape(-1, 1)
@@ -188,7 +362,7 @@ class PointAvatar(nn.Module):
             bkgd = torch.sigmoid(self.background * 100)
             rgb_values = images[..., :3].reshape(-1, 3) + (1 - foreground_mask) * bkgd.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, 3)
 
-        knn_v = self.FLAMEServer.canonical_verts.unsqueeze(0).clone()
+        knn_v = self.canonical_verts.clone()
         flame_distance, index_batch, _ = knn_points(pnts_c_flame.unsqueeze(0), knn_v, K=1, return_nn=True)
         index_batch = index_batch.reshape(-1)
 
@@ -218,7 +392,7 @@ class PointAvatar(nn.Module):
                 'albedo_image': images[..., albedo_begin_index:albedo_begin_index+3].reshape(-1, 3) + (1 - foreground_mask),
                 'rendered_landmarks': rendered_landmarks.reshape(-1, 3),
                 'pnts_color_deformed': rgb_points.reshape(batch_size, n_points, 3),
-                'canonical_verts': self.FLAMEServer.canonical_verts.reshape(-1, 3),
+                'canonical_verts': self.canonical_verts.reshape(-1, 3),
                 'deformed_verts': verts.reshape(-1, 3),
                 'deformed_points': transformed_points.reshape(batch_size, n_points, 3),
                 'pnts_normal_deformed': normals_points.reshape(batch_size, n_points, 3),
@@ -247,7 +421,7 @@ class PointAvatar(nn.Module):
             posedirs = posedirs.expand(batch_size, -1, -1)
             lbs_weights = lbs_weights.expand(batch_size, -1)
             pnts_c_flame = pnts_c_flame.expand(batch_size, -1)
-            pnts_d = self.FLAMEServer.forward_pts(pnts_c_flame, betas, transformations, pose_feature, shapedirs, posedirs, lbs_weights)
+            pnts_d = self.forward_pts(pnts_c_flame, betas, transformations, pose_feature, shapedirs, posedirs, lbs_weights)
             pnts_d = pnts_d.reshape(-1)
             return pnts_d, pnts_d
 
@@ -270,3 +444,45 @@ class PointAvatar(nn.Module):
         albedo = feature_vectors
         rgb_vals = torch.clamp(shading * albedo * 2, 0., 1.)
         return pnts_d, rgb_vals, albedo, shading, normals_d
+
+
+    def forward_pts(
+        self, 
+        pnts_c, 
+        betas, 
+        transformations, 
+        pose_features, 
+        shapedirs, 
+        posedirs, 
+        lbs_weights, 
+        dtype=torch.float32, 
+        mask=None
+    ):
+        assert len(pnts_c.shape) == 2
+        if mask is not None:
+            pnts_c = pnts_c[mask]
+            betas = betas[mask]
+            transformations = transformations[mask]
+            pose_features = pose_features[mask]
+        num_points = pnts_c.shape[0]
+        
+        pnts_c_original = inverse_pts(
+            pnts_c, 
+            self.canonical_expression.expand(num_points, -1),
+            self.canonical_transformations.expand(num_points, -1, -1, -1),
+            self.canonical_pose_feature.expand(num_points, -1),
+            shapedirs, 
+            posedirs,
+            lbs_weights,
+            dtype=dtype
+        )
+        pnts_p = forward_pts(
+            pnts_c_original,
+            betas,
+            transformations,
+            pose_features,
+            shapedirs, posedirs,
+            lbs_weights, 
+            dtype=dtype
+        )
+        return pnts_p

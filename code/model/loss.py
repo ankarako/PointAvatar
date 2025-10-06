@@ -49,7 +49,8 @@ class Loss(nn.Module):
         else:
             gt_lbs_weight = flame_lbs_weights[index_batch, :]
 
-        gt_shapedirs = flame_shapedirs[index_batch, :, 100:]
+        # we use 300 id shapedirs
+        gt_shapedirs = flame_shapedirs[index_batch, :, 300:]
         gt_posedirs = torch.transpose(flame_posedirs.reshape(36, -1, 3), 0, 1)[index_batch, :, :]
 
         output = {
@@ -70,7 +71,7 @@ class Loss(nn.Module):
 
     def forward(self, model_outputs, ground_truth):
         predicted_mask = model_outputs['predicted_mask']
-        object_mask = ground_truth['object_mask']
+        object_mask = ground_truth['msk'].reshape(-1, 1)
         mask_loss = self.get_mask_loss(predicted_mask, object_mask)
 
         rgb_loss = self.get_rgb_loss(model_outputs['rgb_image'], ground_truth['rgb'])
@@ -122,7 +123,7 @@ class Loss(nn.Module):
             out['posedirs_loss'] = posedirs_loss
 
             gt_shapedirs = outputs['gt_shapedirs'].reshape(num_points, -1)
-            shapedirs_loss = self.get_lbs_loss(model_outputs['shapedirs'].reshape(num_points, -1)[:, :50*3] * 10,
+            shapedirs_loss = self.get_lbs_loss(model_outputs['shapedirs'].reshape(num_points, -1) * 10,
                                                gt_shapedirs * 10,
                                                use_var_expression=True,
                                                )

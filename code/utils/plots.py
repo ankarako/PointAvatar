@@ -26,10 +26,10 @@ def save_pcl_to_ply(filename, points, colors=None, normals=None):
     return
 
 
-def plot(img_index, model_outputs, ground_truth, path, epoch, img_res, is_eval=False, first=False):
+def plot(img_index, model_outputs, sample, path, epoch, img_res, is_eval=False, first=False):
     # arrange data to plot
     batch_size = model_outputs['batch_size']
-    plot_images(model_outputs, ground_truth, path, epoch, img_index, 1, img_res, batch_size, is_eval)
+    plot_images(model_outputs, sample, path, epoch, img_index, 1, img_res, batch_size, is_eval)
 
     canonical_color = torch.clamp(model_outputs['pnts_albedo'], 0., 1.)
     if not is_eval:
@@ -120,7 +120,7 @@ def plot_images(model_outputs, ground_truth, path, epoch, img_index, plot_nrow, 
         rgb_gt = ground_truth['rgb']
         if 'rendered_landmarks' in model_outputs:
             rendered_landmarks = model_outputs['rendered_landmarks'].reshape(batch_size, num_samples, 3)
-            rgb_gt = rgb_gt * (1 - rendered_landmarks) + rendered_landmarks * torch.tensor([1, 0, 0]).cuda()
+            rgb_gt = rgb_gt.reshape(batch_size, -1, 3) * (1 - rendered_landmarks) + rendered_landmarks * torch.tensor([1, 0, 0]).cuda()
     else:
         rgb_gt = None
     rgb_points = model_outputs['rgb_image']
@@ -157,7 +157,8 @@ def plot_images(model_outputs, ground_truth, path, epoch, img_index, plot_nrow, 
     wo_epoch_path = path[0].replace('/epoch_{}'.format(epoch), '')
     if not os.path.exists('{0}/rendering'.format(wo_epoch_path)):
         os.mkdir('{0}/rendering'.format(wo_epoch_path))
-    img.save('{0}/rendering/epoch_{1:04d}_{2}.png'.format(wo_epoch_path, epoch, img_index[0]))
+    filepath = '{0}/rendering/epoch_{1:04d}_{2}.png'.format(wo_epoch_path, epoch, img_index[0])
+    img.save(img_index)
 
     if is_eval:
         for i, idx in enumerate(img_index):

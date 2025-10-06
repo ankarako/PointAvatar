@@ -6,7 +6,7 @@ class PointCloud(nn.Module):
         self,
         n_init_points,
         max_points=131072,
-        init_radius=0.5,
+        init_radius=0.2,
         radius_factor=0.3
     ):
         super(PointCloud, self).__init__()

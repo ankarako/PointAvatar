@@ -72,7 +72,7 @@ class FLAME(nn.Module):
 
         # end: for plotting landmarks, to make sure that camera is correct. This is so hard to debug otherwise...
 
-        factor = 4
+        factor = 1
 
         self.dtype = torch.float32
         self.register_buffer('faces_tensor', to_tensor(to_np(flame_model.f, dtype=np.int64), dtype=torch.long))

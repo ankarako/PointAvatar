@@ -14,6 +14,13 @@ from model.point_avatar_model import PointAvatar
 from model.loss import Loss
 print = partial(print, flush=True)
 
+import tloaders
+from tqdm import tqdm
+
+from pytorch3d.io import save_ply
+import trimesh
+import t3d
+
 
 class TrainRunner():
     def __init__(self, **kwargs):
@@ -26,15 +33,15 @@ class TrainRunner():
         self.exps_folder_name = self.conf.get_string('train.exps_folder')
         self.optimize_expression = self.conf.get_bool('train.optimize_expression')
         self.optimize_pose = self.conf.get_bool('train.optimize_camera')
-        self.subject = self.conf.get_string('dataset.subject_name')
+        self.subject = self.conf.get_string('subject_id')
         self.methodname = self.conf.get_string('train.methodname')
 
-        os.environ['WANDB_DIR'] = os.path.join(self.exps_folder_name)
-        wandb.init(project=kwargs['wandb_workspace'], name=self.subject + '_' + self.methodname, config=self.conf, tags=kwargs['wandb_tags'])
+        # os.environ['WANDB_DIR'] = os.path.join(self.exps_folder_name)
+        # wandb.init(project=kwargs['wandb_workspace'], name=self.subject + '_' + self.methodname, config=self.conf, tags=kwargs['wandb_tags'])
 
         self.optimize_inputs = self.optimize_expression or self.optimize_pose
         self.expdir = os.path.join(self.exps_folder_name, self.subject, self.methodname)
-        train_split_name = utils.get_split_name(self.conf.get_list('dataset.train.sub_dir'))
+        train_split_name = self.subject
 
         self.eval_dir = os.path.join(self.expdir, train_split_name, 'eval')
         self.train_dir = os.path.join(self.expdir, train_split_name, 'train')
@@ -81,34 +88,90 @@ class TrainRunner():
 
         self.use_background = self.conf.get_bool('dataset.use_background', default=False)
 
-        self.train_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(data_folder=self.conf.get_string('dataset.data_folder'),
-                                                                                          subject_name=self.conf.get_string('dataset.subject_name'),
-                                                                                          json_name=self.conf.get_string('dataset.json_name'),
-                                                                                          use_mean_expression=self.conf.get_bool('dataset.use_mean_expression', default=False),
-                                                                                          use_var_expression=self.conf.get_bool('dataset.use_var_expression', default=False),
-                                                                                          use_background=self.use_background,
-                                                                                          is_eval=False,
-                                                                                          **self.conf.get_config('dataset.train'))
 
-        self.plot_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(data_folder=self.conf.get_string('dataset.data_folder'),
-                                                                                         subject_name=self.conf.get_string('dataset.subject_name'),
-                                                                                         json_name=self.conf.get_string('dataset.json_name'),
-                                                                                         use_background=self.use_background,
-                                                                                         is_eval=True,
-                                                                                         **self.conf.get_config('dataset.test'))
+        self.train_dataset: tloaders.GaussianAvatars = tloaders.DatasetRegistry.get_dataset(
+            "GaussianAvatars", **self.conf.get('dataset_train')
+        )
+
+        self.eval_dataset: tloaders.GaussianAvatars = tloaders.DatasetRegistry.get_dataset(
+            "GaussianAvatars", **self.conf.get('dataset_val')
+        )
+
+        self.test_dataset: tloaders.GaussianAvatars = tloaders.DatasetRegistry.get_dataset(
+            "GaussianAvatars", **self.conf.get('dataset_test')
+        )
+
+        # self.train_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(data_folder=self.conf.get_string('dataset.data_folder'),
+        #                                                                                   subject_name=self.conf.get_string('dataset.subject_name'),
+        #                                                                                   json_name=self.conf.get_string('dataset.json_name'),
+        #                                                                                   use_mean_expression=self.conf.get_bool('dataset.use_mean_expression', default=False),
+        #                                                                                   use_var_expression=self.conf.get_bool('dataset.use_var_expression', default=False),
+        #                                                                                   use_background=self.use_background,
+        #                                                                                   is_eval=False,
+        #                                                                                   **self.conf.get_config('dataset.train'))
+
+        # self.plot_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(data_folder=self.conf.get_string('dataset.data_folder'),
+        #                                                                                  subject_name=self.conf.get_string('dataset.subject_name'),
+        #                                                                                  json_name=self.conf.get_string('dataset.json_name'),
+        #                                                                                  use_background=self.use_background,
+        #                                                                                  is_eval=True,
+        #                                                                                  **self.conf.get_config('dataset.test'))
         print('Finish loading data ...')
+        
+        self.shape_params = self.train_dataset[0]['fl_id_params']
+        self.img_res = self.train_dataset[0]['rgb'].shape[0:2]
+        
+        # calculate mean and var expression as the original codebase does
+        # inside real_dataset
+        # check if we have already saved mean and var expression for this subject
+        mean_exp_path = os.path.join("confs", f"exp.mean-poses-{self.subject}.torch")
+        self.poses = []
+        if not os.path.exists(mean_exp_path):
+            exps = []
+            sample: tloaders.FlameSample
+            for sample in tqdm(self.train_dataset, total=len(self.train_dataset), desc="Calculating mean and var expression"):
+                exps += [sample['fl_ex_params'].unsqueeze(0)]
+                if self.optimize_pose:
+                    pose = torch.cat([
+                        sample['fl_rot'].unsqueeze(0),
+                        sample['fl_neck'].unsqueeze(0),
+                        sample['fl_jaw'].unsqueeze(0),
+                        sample['fl_eyes'].unsqueeze(0),
+                        sample['fl_trans'].unsqueeze(0)
+                    ], dim=-1)
+                    self.poses += [pose]
+            self.exps = torch.cat(exps, dim=0)
+            self.exp_mean = self.exps.mean(dim=0).unsqueeze(0)
+            self.exp_var = self.exps.var(dim=0).unsqueeze(0)
+            self.poses = torch.cat(self.poses, dim=0)
+            torch.save({
+                "mean": self.exp_mean,
+                "var": self.exp_var,
+                "exps": self.exps,
+                'poses': self.poses
+            }, mean_exp_path)
+        else:
+            exp_mean = torch.load(mean_exp_path)
+            self.exp_mean = exp_mean['mean']
+            self.exp_var = exp_mean['var']
+            self.exps = exp_mean['exps']
+            if self.optimize_pose:
+                self.poses = exp_mean['poses']
 
-        self.model = PointAvatar(conf=self.conf.get_config('model'),
-                                shape_params=self.train_dataset.shape_params,
-                                img_res=self.train_dataset.img_res,
-                                canonical_expression=self.train_dataset.mean_expression,
-                                canonical_pose=self.conf.get_float('dataset.canonical_pose', default=0.2),
-                                use_background=self.use_background)
+        self.model = PointAvatar(
+            conf=self.conf.get_config('model'),
+            shape_params=self.shape_params,
+            img_res=self.img_res,
+            canonical_expression=self.exp_mean,
+            canonical_pose=0.4,
+            use_background=self.use_background,
+            flame_kwargs=self.conf.get('flame_kwargs'),
+        )
         self._init_dataloader()
         if torch.cuda.is_available():
             self.model.cuda()
 
-        self.loss = Loss(**self.conf.get_config('loss'), var_expression=self.train_dataset.var_expression)
+        self.loss = Loss(**self.conf.get_config('loss'), var_expression=self.exp_var)
 
         self.lr = self.conf.get_float('train.learning_rate')
         self.optimizer = torch.optim.Adam([
@@ -123,14 +186,18 @@ class TrainRunner():
             num_training_frames = len(self.train_dataset)
             param = []
             if self.optimize_expression:
-                init_expression = torch.cat((self.train_dataset.data["expressions"], torch.randn(self.train_dataset.data["expressions"].shape[0], max(self.model.deformer_network.num_exp - 50, 0)).float()), dim=1)
+                init_expression = self.exps
+                # init_expression = torch.cat((
+                #     self.exps, 
+                #     torch.randn(self.exps.shape[0], max(self.model.deformer_network.num_exp - 50, 0)).float()
+                # ), dim=1)
                 self.expression = torch.nn.Embedding(num_training_frames, self.model.deformer_network.num_exp, _weight=init_expression, sparse=True).cuda()
                 param += list(self.expression.parameters())
 
             if self.optimize_pose:
-                self.flame_pose = torch.nn.Embedding(num_training_frames, 15, _weight=self.train_dataset.data["flame_pose"], sparse=True).cuda()
-                self.camera_pose = torch.nn.Embedding(num_training_frames, 3, _weight=self.train_dataset.data["world_mats"][:, :3, 3], sparse=True).cuda()
-                param += list(self.flame_pose.parameters()) + list(self.camera_pose.parameters())
+                self.flame_pose = torch.nn.Embedding(num_training_frames, 18, _weight=self.poses, sparse=True).cuda()
+                # self.camera_pose = torch.nn.Embedding(num_training_frames, 3, _weight=self.train_dataset.data["world_mats"][:, :3, 3], sparse=True).cuda()
+                param += list(self.flame_pose.parameters()) #+ list(self.camera_pose.parameters())
             self.optimizer_cam = torch.optim.SparseAdam(param, self.conf.get_float('train.learning_rate_cam'))
 
         self.start_epoch = 0
@@ -178,14 +245,15 @@ class TrainRunner():
                 except:
                     print("expression or pose parameter group doesn't match")
 
-        self.train_dataloader = torch.utils.data.DataLoader(self.train_dataset,
-                                                            batch_size=self.batch_size,
-                                                            shuffle=True,
-                                                            collate_fn=self.train_dataset.collate_fn,
-                                                            num_workers=4,
-                                                            )
+        # self.train_dataloader = torch.utils.data.DataLoader(
+        #     self.train_dataset,
+        #     batch_size=self.batch_size,
+        #     shuffle=True,
+        #     collate_fn=self.train_dataset.collate_fn,
+        #     num_workers=4,
+        # )
         self.n_batches = len(self.train_dataloader)
-        self.img_res = self.plot_dataset.img_res
+        self.img_res = self.img_res
         self.plot_freq = self.conf.get_int('train.plot_freq')
         self.save_freq = self.conf.get_int('train.save_freq', default=1)
 
@@ -198,18 +266,24 @@ class TrainRunner():
         #    self.loss.lbs_weight = 0.
 
     def _init_dataloader(self):
-        self.train_dataloader = torch.utils.data.DataLoader(self.train_dataset,
-                                                            batch_size=self.batch_size,
-                                                            shuffle=True,
-                                                            collate_fn=self.train_dataset.collate_fn,
-                                                            num_workers=4,
-                                                            )
-        self.plot_dataloader = torch.utils.data.DataLoader(self.plot_dataset,
-                                                           batch_size=min(self.batch_size * 2, 10),
-                                                           shuffle=False,
-                                                           collate_fn=self.plot_dataset.collate_fn,
-                                                           num_workers=4,
-                                                           )
+        self.train_dataloader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=4,
+        )
+        self.eval_dataloader = torch.utils.data.DataLoader(
+            self.eval_dataset,
+            batch_size=min(self.batch_size * 2, 10),
+            shuffle=False,
+            num_workers=4,
+        )
+        self.test_dataloader = torch.utils.data.DataLoader(
+            self.test_dataset,
+            batch_size=min(self.batch_size * 2, 10),
+            shuffle=False,
+            num_workers=4,
+        )
         self.n_batches = len(self.train_dataloader)
     def save_checkpoints(self, epoch, only_latest=False):
         if not only_latest:
@@ -250,7 +324,7 @@ class TrainRunner():
                 dict_to_save["expression_state_dict"] = self.expression.state_dict()
             if self.optimize_pose:
                 dict_to_save["flame_pose_state_dict"] = self.flame_pose.state_dict()
-                dict_to_save["camera_pose_state_dict"] = self.camera_pose.state_dict()
+                # dict_to_save["camera_pose_state_dict"] = self.camera_pose.state_dict()
             if not only_latest:
                 torch.save(dict_to_save, os.path.join(self.checkpoints_path, self.input_params_subdir, str(epoch) + ".pth"))
             torch.save(dict_to_save, os.path.join(self.checkpoints_path, self.input_params_subdir, "latest.pth"))
@@ -306,54 +380,57 @@ class TrainRunner():
                         self.expression.eval()
                     if self.optimize_pose:
                         self.flame_pose.eval()
-                        self.camera_pose.eval()
-                eval_iterator = iter(self.plot_dataloader)
+                        # self.camera_pose.eval()
+                eval_iterator = iter(self.test_dataloader)
                 start_time.record()
-                for batch_index in range(len(self.plot_dataloader)):
-                    indices, model_input, ground_truth = next(eval_iterator)
-                    for k, v in model_input.items():
+                for batch_index in range(len(self.test_dataloader)):
+                    # indices, model_input, ground_truth = next(eval_iterator)
+                    sample = next(eval_iterator)
+                    for k, v in sample.items():
                         try:
-                            model_input[k] = v.cuda()
+                            sample[k] = v.cuda()
                         except:
-                            model_input[k] = v
-                    for k, v in ground_truth.items():
-                        try:
-                            ground_truth[k] = v.cuda()
-                        except:
-                            ground_truth[k] = v
+                            sample[k] = v
+                    # for k, v in ground_truth.items():
+                    #     try:
+                    #         ground_truth[k] = v.cuda()
+                    #     except:
+                    #         ground_truth[k] = v
 
-                    model_outputs = self.model(model_input)
+                    model_outputs = self.model(sample)
                     for k, v in model_outputs.items():
                         try:
                             model_outputs[k] = v.detach()
                         except:
                             model_outputs[k] = v
-                    plot_dir = [os.path.join(self.eval_dir, model_input['sub_dir'][i], 'epoch_'+str(epoch)) for i in range(len(model_input['sub_dir']))]
-                    img_names = model_input['img_name'][:, 0].cpu().numpy()
+                    plot_dir = os.path.join(self.eval_dir, f'epoch_{epoch}')
+                    img_names = os.path.join(plot_dir, f"render_{batch_index}.png")
                     print("Plotting images: {}".format(img_names))
-                    utils.mkdir_ifnotexists(os.path.join(self.eval_dir, model_input['sub_dir'][0]))
+                    utils.mkdir_ifnotexists(plot_dir)
 
-                    plt.plot(img_names,
-                             model_outputs,
-                             ground_truth,
-                             plot_dir,
-                             epoch,
-                             self.img_res,
-                             is_eval=False,
-                             first=(batch_index==0),
-                             )
-                    del model_outputs, ground_truth
+                    if batch_index % 50 == 0:
+                        plt.plot(
+                            img_names,
+                            model_outputs,
+                            sample,
+                            plot_dir,
+                            epoch,
+                            self.img_res,
+                            is_eval=False,
+                            first=(batch_index==0),
+                        )
+                    del model_outputs, sample
 
                 end_time.record()
                 torch.cuda.synchronize()
-                print("Plot time per image: {} ms".format(start_time.elapsed_time(end_time) / len(self.plot_dataset)))
+                print("Plot time per image: {} ms".format(start_time.elapsed_time(end_time) / len(self.eval_dataset)))
                 self.model.train()
                 if self.optimize_inputs:
                     if self.optimize_expression:
                         self.expression.train()
                     if self.optimize_pose:
                         self.flame_pose.train()
-                        self.camera_pose.train()
+                        # self.camera_pose.train()
 
             start_time.record()
 
@@ -381,28 +458,33 @@ class TrainRunner():
             # re-init visible point tensor each epoch
             self.model.visible_points = torch.zeros(self.model.pc.points.shape[0]).bool().cuda()
 
-            for data_index, (indices, model_input, ground_truth) in enumerate(self.train_dataloader):
-                for k, v in model_input.items():
+            for data_index, sample in enumerate(self.train_dataloader):
+                for k, v in sample.items():
                     try:
-                        model_input[k] = v.cuda()
+                        sample[k] = v.cuda()
                     except:
-                        model_input[k] = v
-                for k, v in ground_truth.items():
-                    try:
-                        ground_truth[k] = v.cuda()
-                    except:
-                        ground_truth[k] = v
+                        sample[k] = v
+                # for k, v in ground_truth.items():
+                #     try:
+                #         ground_truth[k] = v.cuda()
+                #     except:
+                #         ground_truth[k] = v
 
                 if self.optimize_inputs:
                     if self.optimize_expression:
-                        model_input['expression'] = self.expression(model_input["idx"]).squeeze(1)
+                        sample['fl_ex_params'] = self.expression(sample["id"]).squeeze(1)
                     if self.optimize_pose:
-                        model_input['flame_pose'] = self.flame_pose(model_input["idx"]).squeeze(1)
-                        model_input['cam_pose'][:, :3, 3] = self.camera_pose(model_input["idx"]).squeeze(1)
+                        flame_pose = self.flame_pose(sample["id"]).squeeze(1)
+                        sample['fl_rot'] = flame_pose[:, 0:3]
+                        sample['fl_neck'] = flame_pose[:, 3:6]
+                        sample['fl_jaw'] = flame_pose[:, 6:9]
+                        sample['fl_eyes'] = flame_pose[:, 9:15]
+                        sample['fl_trans'] = flame_pose[:, 15:18]
+                        # model_input['cam_pose'][:, :3, 3] = self.camera_pose(model_input["idx"]).squeeze(1)
 
-                model_outputs = self.model(model_input)
+                model_outputs = self.model(sample)
 
-                loss_output = self.loss(model_outputs, ground_truth)
+                loss_output = self.loss(model_outputs, sample)
 
                 loss = loss_output['loss']
 
@@ -434,13 +516,13 @@ class TrainRunner():
                     acc_loss['radius'] = self.model.raster_settings.radius
 
                     acc_loss['lr'] = self.scheduler.get_last_lr()[0]
-                    wandb.log(acc_loss, step=epoch * len(self.train_dataset) + data_index * self.batch_size)
+                    # wandb.log(acc_loss, step=epoch * len(self.train_dataset) + data_index * self.batch_size)
                     acc_loss = {}
 
             self.scheduler.step()
             end_time.record()
             torch.cuda.synchronize()
-            wandb.log({"timing_epoch": start_time.elapsed_time(end_time)}, step=(epoch+1) * len(self.train_dataset))
+            # wandb.log({"timing_epoch": start_time.elapsed_time(end_time)}, step=(epoch+1) * len(self.train_dataset))
             print("Epoch time: {} s".format(start_time.elapsed_time(end_time)/1000))
         self.save_checkpoints(self.nepochs + 1)
 
